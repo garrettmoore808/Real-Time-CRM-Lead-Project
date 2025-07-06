@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ingestion-service
+  Sample SAM template for CRM ingestion Lambda
+
+Globals:
+  Function:
+    Timeout: 30       # seconds
+    MemorySize: 128   # MB
+
+Resources:
+  # Raw S3 bucket for incoming CRM events
+  RawBucket:
+    Type: AWS::S3::Bucket
+
+  # New bucket to hold owner‑lookup JSON
+  LookupBucket:
+    Type: AWS::S3::Bucket
+
+  # Dead-letter queue for failed SQS messages
+  DLQ:
+    Type: AWS::SQS::Queue
+
+  # Delay queue with a 10-minute default message visibility
+  DelayQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+        maxReceiveCount: 3
+
+  # Bucket to hold enriched lead JSON
+  EnrichedBucket:
+    Type: AWS::S3::Bucket
+
+  # Lambda to enrich leads after the 10-min delay
+  EnrichmentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      CodeUri: EnrichmentFunction/
+      Events:
+        LeadSQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DelayQueue.Arn
+            BatchSize: 1
+      Environment:
+        Variables:
+          RAW_BUCKET:      !Ref RawBucket
+          ENRICHED_BUCKET: !Ref EnrichedBucket
+          LOOKUP_BUCKET:   !Ref LookupBucket
+          LOOKUP_REGION:   us-east-1
+          SES_FROM_ADDRESS: "gmooredev@gmail.com" 
+          SES_TO_ADDRESS:   "gmooredev@gmail.com"      
+
+    Policies:
+      # Allow GetObject on raw bucket objects
+      - PolicyName: EnrichmentRawBucketRead
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${RawBucket}/raw/*
+      # Read owner lookup JSON
+      - S3ReadPolicy:
+          BucketName: !Ref LookupBucket
+      # Write enriched JSON
+      - S3WritePolicy:
+          BucketName: !Ref EnrichedBucket
+      # Allow sending email via SES
+      - Statement:
+        Effect: Allow
+        Action:
+          - ses:SendEmail
+          - ses:SendRawEmail
+        Resource: "*"
+
+
+  # Ingestion Lambda, triggered via API Gateway
+  IngestionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      CodeUri: IngestionFunction/
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+          DELAY_QUEUE_URL: !Ref DelayQueue
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${RawBucket}/raw/*
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt DelayQueue.Arn
+      Events:
+        IngestApi:
+          Type: Api
+          Properties:
+            Path: /ingest
+            Method: post
+
+Outputs:
+  IngestApi:
+    Description: "API Gateway endpoint for /ingest"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/ingest"
